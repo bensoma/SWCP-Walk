@@ -555,12 +555,11 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:15px;heigh
         <div id="zipProgress" class="sync-progress" style="display:none"></div>
       </section>
 
-      <!-- Pane B — Cloud sync status -->
+      <!-- Pane B — Cloud sync status (populated by renderSyncBackendPane) -->
       <section class="sync-pane">
         <h4 class="sync-pane-title">Cloud sync</h4>
         <div id="syncBackendInfo">
-          <p class="sync-pane-blurb"><strong>No cloud sync configured.</strong> Walks live in this browser's local storage. Use ZIP backup above to create portable copies.</p>
-          <p class="sync-pane-blurb" style="font-size:.78rem;color:var(--slate-light)">A future GitHub Gist sync option (per upgrade brief §6) will live here.</p>
+          <p class="sync-pane-blurb">Loading…</p>
         </div>
       </section>
 
@@ -927,6 +926,9 @@ async function getGpxDataUrl(walkId){
 async function loadLocal(){
   await dbOpen();
   await migrateFromLocalStorage();
+  // Hydrate sync config and ensure a device ID exists (lazy create on first run)
+  await loadSyncConfig();
+  await getDeviceId();
   try{
     const records = await idbGetAll('walks');
     // Rehydrate transient binary fields onto each walk record
@@ -1144,6 +1146,71 @@ async function migrateFromLocalStorage(){
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 3C — SYNC CONFIG & DEVICE ID PERSISTENCE  (Option B — Gist sync)
+//
+//  Bridges the in-memory syncConfig and the IDB settings store. The PAT lives
+//  under its own key — never inside syncConfig itself, never serialised into
+//  ZIP backups or walks.json. The device ID is a per-installation UUID created
+//  lazily on first read; it surfaces in swcp-meta.json so devices syncing to
+//  the same Gist are distinguishable in the audit trail.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const SETTINGS_KEY_SYNC_CONFIG = 'sync_config';
+const SETTINGS_KEY_GITHUB_PAT  = 'github_pat';
+const SETTINGS_KEY_DEVICE_ID   = 'device_id';
+
+/**
+ * Read sync config from IDB and hydrate the global syncConfig. Falls back to
+ * defaults on failure. Idempotent.
+ */
+async function loadSyncConfig(){
+  try{
+    const rec = await idbGet('settings', SETTINGS_KEY_SYNC_CONFIG);
+    if(rec && rec.value && typeof rec.value === 'object'){
+      syncConfig = {
+        backend: rec.value.backend || 'none',
+        gistId:  rec.value.gistId  || null,
+        patHint: rec.value.patHint || null,
+      };
+    }
+  }catch(e){ console.warn('loadSyncConfig failed', e); }
+}
+
+/** Persist current syncConfig to IDB. */
+async function saveSyncConfig(){
+  try{
+    await idbPut('settings', { key: SETTINGS_KEY_SYNC_CONFIG, value: { ...syncConfig } });
+  }catch(e){ console.warn('saveSyncConfig failed', e); }
+}
+
+/** Read PAT from IDB. Returns null if absent. */
+async function getPat(){
+  try{
+    const rec = await idbGet('settings', SETTINGS_KEY_GITHUB_PAT);
+    return (rec && rec.value) || null;
+  }catch(e){ return null; }
+}
+
+/** Store PAT in IDB. Pass null/empty to clear. */
+async function setPat(pat){
+  try{
+    if(!pat){ await idbDelete('settings', SETTINGS_KEY_GITHUB_PAT); return; }
+    await idbPut('settings', { key: SETTINGS_KEY_GITHUB_PAT, value: pat });
+  }catch(e){ console.warn('setPat failed', e); }
+}
+
+/** Read device ID; lazily create one on first call. */
+async function getDeviceId(){
+  try{
+    const rec = await idbGet('settings', SETTINGS_KEY_DEVICE_ID);
+    if(rec && rec.value) return rec.value;
+    const id = uid() + '-' + uid().slice(-4);
+    await idbPut('settings', { key: SETTINGS_KEY_DEVICE_ID, value: id });
+    return id;
+  }catch(e){ return 'unknown'; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  SECTION 6 — OFFLINE OUTBOX  (backend-agnostic, Phase B)
 //
 //  Queue + retry infrastructure for sync operations to whatever cloud backend
@@ -1186,6 +1253,19 @@ function isNetworkError(e){
   return e instanceof TypeError && /failed to fetch|network/i.test(e.message);
 }
 
+/**
+ * True for errors that should NOT consume a retry attempt. Covers TypeError
+ * (request never reached the server) and HTTP 5xx (server hiccup that's
+ * worth retrying without user intervention).
+ * @param {Error} e
+ * @returns {boolean}
+ */
+function isTransientError(e){
+  if(isNetworkError(e)) return true;
+  if(e && typeof e.status === 'number' && e.status >= 500 && e.status < 600) return true;
+  return false;
+}
+
 /** Read the current outbox array from localStorage. @returns {Array<Object>} */
 function outboxLoad(){
   try{return JSON.parse(localStorage.getItem(OUTBOX_KEY)||'[]');}catch(e){return[];}
@@ -1220,9 +1300,12 @@ function outboxLastSyncedLabel(){
 }
 
 /**
- * Enqueue a backend operation. Deduplicates by type so that rapid saves do not
- * accumulate redundant master-sync entries. In Phase B no callers enqueue;
- * Option B will reactivate this when backend !== 'none'.
+ * Enqueue a backend operation. Coalesces by op-and-walkId so rapid
+ * save→edit→save sequences collapse to a single queue entry holding the
+ * latest version. sync_walk and sync_delete are coalesced independently of
+ * each other (per design decision): a queued save followed by a queued
+ * delete leaves both queued, executed in order — the delete is what
+ * eventually wins on the remote.
  * @param {string} type
  * @param {Object} payload
  */
@@ -1232,6 +1315,14 @@ function outboxEnqueue(type, payload){
   const entry = {id:uid(), type, status:'pending', payload, createdAt:new Date().toISOString(), attempts:0, lastAttempt:null, lastError:null};
   if(type === 'sync_master'){
     const idx = items.findIndex(i => i.type === 'sync_master');
+    if(idx >= 0) items[idx] = entry; else items.push(entry);
+  } else if((type === 'sync_walk' || type === 'sync_delete') && payload && payload.walkId){
+    // Coalesce by walkId for the same op type — the latest entry replaces
+    // any prior pending one. A failed item is left alone (user retries it
+    // explicitly via the failed-items pane).
+    const idx = items.findIndex(i => i.type === type
+                                  && i.status === 'pending'
+                                  && i.payload && i.payload.walkId === payload.walkId);
     if(idx >= 0) items[idx] = entry; else items.push(entry);
   } else {
     items.push(entry);
@@ -1254,19 +1345,36 @@ async function outboxFlush(){
   if(!pending.length) return;
 
   let anySucceeded = false;
+  // Per-flush guards so a queue-wide PAT or 404 failure surfaces only one toast
+  let toasted401 = false;
+  let toasted404 = false;
 
   for(const item of pending){
     let ok = false;
-    let networkFail = false;
+    let transient = false;
+    let permanentFail = false;
     try{
-      // ── Backend dispatch — Option B inserts its branches here ──────────
-      // if(syncConfig.backend === 'gist'){ await gistDispatch(item); ok = true; }
-      // For Phase B with no backend wired, we should not have reached this loop.
-      throw new Error('No backend handler for type='+item.type);
+      // ── Backend dispatch ───────────────────────────────────────────────
+      if(syncConfig.backend === 'gist'){
+        await dispatchGistOp(item);
+        ok = true;
+      } else {
+        throw new Error('No backend handler for type='+item.type);
+      }
     } catch(e){
-      networkFail = isNetworkError(e);
+      transient     = isTransientError(e);
+      permanentFail = e && (e.status === 401 || e.status === 404);
       item.lastError = e.message;
-      console.warn('Outbox flush failed for', item.type, networkFail ? '(network)' : '(API)', e.message);
+      if(e && e.status === 401 && !toasted401){
+        showToast('Bad PAT — re-authenticate in Sync settings', 'error');
+        toasted401 = true;
+      } else if(e && e.status === 404 && !toasted404){
+        showToast('Gist not found — reconfigure in Sync settings', 'error');
+        toasted404 = true;
+      }
+      console.warn('Outbox flush failed for', item.type,
+        permanentFail ? '(permanent)' : transient ? '(transient)' : '(API)',
+        e.message);
     }
 
     item.lastAttempt = new Date().toISOString();
@@ -1275,13 +1383,19 @@ async function outboxFlush(){
       const idx = items.findIndex(i => i.id === item.id);
       if(idx >= 0) items.splice(idx, 1);
       anySucceeded = true;
-    } else if(!networkFail){
+    } else if(permanentFail){
+      // 401/404 — no point retrying without user action
+      item.attempts = OUTBOX_MAX_ATTEMPTS;
+      item.status   = 'failed';
+      console.warn('Outbox: item moved to failed state (permanent)', item.id, item.type);
+    } else if(!transient){
       item.attempts = (item.attempts || 0) + 1;
       if(item.attempts >= OUTBOX_MAX_ATTEMPTS){
         item.status = 'failed';
         console.warn('Outbox: item moved to failed state after max attempts', item.id, item.type);
       }
     }
+    // transient (network or 5xx) → leave as 'pending', no attempt increment
   }
 
   outboxSave(items);
@@ -1441,6 +1555,356 @@ function syncStatusUpdate(){
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 6B — GIST CLIENT + PULL/MERGE  (Option B — GitHub Gist sync)
+//
+//  Thin wrapper over GitHub's Gist REST API plus the pull-and-merge logic.
+//  The four API entry points cover the full surface: read (multi-file fetch),
+//  write (PATCH one or more sidecars), create (POST a new secret Gist seeded
+//  with current data), delete-file (PATCH with a null entry).
+//
+//  All requests use a PAT with 'gist' scope. The PAT is supplied per call
+//  (not closed over) so caller code can re-fetch from IDB if it has been
+//  rotated mid-session. JSON throughout — no multipart, no binary.
+//
+//  Errors are surfaced as Error objects with .status set when the HTTP layer
+//  returned something. The outbox dispatcher inspects .status to decide
+//  retry vs permanent fail (401/404 → permanent; 5xx → transient).
+//
+//  Sidecar layout in the Gist:
+//    walk-{walkId}.json   one per walk, written only when content has changed
+//    swcp-meta.json       { schemaVersion, lastUpdated, deviceId, walkCount }
+//
+//  _lastSyncedSnapshot[walkId] holds the canonical bytes last seen for each
+//  walk (populated on pull and after a successful push). The push path uses
+//  it to skip rewriting walks whose bytes haven't changed since the snapshot.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const GIST_API = 'https://api.github.com';
+const GIST_META_FILENAME = 'swcp-meta.json';
+const GIST_SCHEMA_VERSION = 1;
+
+/** @type {Object<string,string>} Map of walkId → last-synced serialised JSON.
+ *  Module scope, not persisted — rebuilt on next pull. Allows the push path
+ *  to skip re-uploading walks whose serialisation hasn't changed. */
+let _lastSyncedSnapshot = {};
+
+/** Build the standard headers for an authenticated Gist request. */
+function _gistHeaders(pat){
+  return {
+    'Authorization': `token ${pat}`,
+    'Accept':        'application/vnd.github+json',
+    'Content-Type':  'application/json',
+  };
+}
+
+/** Throw an Error with .status set when an HTTP response is non-2xx. */
+async function _gistThrowIfBad(res){
+  if(res.ok) return;
+  const err = new Error(`Gist API ${res.status}: ${res.statusText}`);
+  err.status = res.status;
+  try{
+    const body = await res.json();
+    if(body && body.message) err.message = `Gist API ${res.status}: ${body.message}`;
+  }catch(e){}
+  throw err;
+}
+
+/** Canonical sidecar serialisation — used for writes and snapshot comparison. */
+function _serialiseWalk(walk){
+  return JSON.stringify(walk, null, 2);
+}
+
+/** Build a swcp-meta.json payload reflecting current state. */
+async function _buildMetaJson(){
+  const deviceId = await getDeviceId();
+  return JSON.stringify({
+    schemaVersion: GIST_SCHEMA_VERSION,
+    lastUpdated:   new Date().toISOString(),
+    deviceId,
+    walkCount:     walks.length,
+  }, null, 2);
+}
+
+/**
+ * Read a Gist's contents and parse the sidecar files. Returns parsed walks,
+ * meta, and the raw file content map (so callers can populate
+ * _lastSyncedSnapshot from canonical bytes).
+ * @param {string} gistId
+ * @param {string} pat
+ * @returns {Promise<{walks:Array, meta:Object|null, raw:Object<string,string>}>}
+ */
+async function gistRead(gistId, pat){
+  const res = await fetch(`${GIST_API}/gists/${gistId}`, { headers: _gistHeaders(pat) });
+  await _gistThrowIfBad(res);
+  const body = await res.json();
+  const out = { walks: [], meta: null, raw: {} };
+  for(const [filename, file] of Object.entries(body.files || {})){
+    if(!file) continue;
+    if(file.truncated){
+      // Files >1MB return truncated; would need raw_url fetch for those. Walk
+      // sidecars should never trigger this — log and skip if it does.
+      console.warn('Gist file truncated, skipping', filename);
+      continue;
+    }
+    const content = file.content || '';
+    out.raw[filename] = content;
+    if(filename === GIST_META_FILENAME){
+      try{ out.meta = JSON.parse(content); }catch(e){ console.warn('Bad meta JSON in Gist', e); }
+    } else if(filename.startsWith('walk-') && filename.endsWith('.json')){
+      try{ out.walks.push(JSON.parse(content)); }
+      catch(e){ console.warn('Bad walk JSON in Gist', filename, e); }
+    }
+  }
+  return out;
+}
+
+/**
+ * PATCH a Gist with one or more file updates. Pass {filename: contentString};
+ * use gistDeleteFile() to remove a file (a null files entry also works but the
+ * dedicated helper reads more clearly at call sites).
+ * @param {string} gistId
+ * @param {string} pat
+ * @param {Object<string,string>} partialFiles
+ */
+async function gistWrite(gistId, pat, partialFiles){
+  const files = {};
+  for(const [name, content] of Object.entries(partialFiles)){
+    files[name] = { content };
+  }
+  const res = await fetch(`${GIST_API}/gists/${gistId}`, {
+    method:  'PATCH',
+    headers: _gistHeaders(pat),
+    body:    JSON.stringify({ files }),
+  });
+  await _gistThrowIfBad(res);
+  return await res.json();
+}
+
+/**
+ * Create a new secret Gist seeded with the current walks and meta.
+ * @returns {Promise<string>} the new Gist ID
+ */
+async function gistCreate(pat, walksToSeed, meta){
+  const files = { [GIST_META_FILENAME]: { content: JSON.stringify(meta, null, 2) } };
+  for(const w of walksToSeed){
+    files[`walk-${w.id}.json`] = { content: _serialiseWalk(w) };
+  }
+  const res = await fetch(`${GIST_API}/gists`, {
+    method:  'POST',
+    headers: _gistHeaders(pat),
+    body:    JSON.stringify({
+      description: 'SWCP Walk Journal sync',
+      public:      false,
+      files,
+    }),
+  });
+  await _gistThrowIfBad(res);
+  const body = await res.json();
+  return body.id;
+}
+
+/** Delete a single file from a Gist. */
+async function gistDeleteFile(gistId, pat, filename){
+  const res = await fetch(`${GIST_API}/gists/${gistId}`, {
+    method:  'PATCH',
+    headers: _gistHeaders(pat),
+    body:    JSON.stringify({ files: { [filename]: null } }),
+  });
+  await _gistThrowIfBad(res);
+  return await res.json();
+}
+
+/**
+ * Strip transient binary fields (photo dataUrls, gpxMap dataUrl/rawText)
+ * from a walk before serialisation. Symmetric with the strip done in
+ * saveLocal() — the Gist sidecar must never contain inline base64.
+ */
+function _stripTransientForSync(w){
+  const photos = (w.photos||[]).map(p => { const {dataUrl, ...rest} = p; return rest; });
+  let gpxMap = w.gpxMap || null;
+  if(gpxMap){ const {dataUrl, rawText, ...rest} = gpxMap; gpxMap = rest; }
+  return { ...w, photos, gpxMap };
+}
+
+/**
+ * Per-walk last-write-wins merge by updatedAt. Walks present in only one side
+ * are kept. Returns the merged array plus the IDs of walks whose effective
+ * record changed (so the caller knows what to persist locally).
+ *
+ * Absent updatedAt is treated as oldest — v7-migrated walks lacking the
+ * field will lose to anything that has it, which matches the upgrade
+ * intent (newer-saved record wins).
+ *
+ * @param {Array} local
+ * @param {Array} remote
+ * @returns {{merged:Array, changedIds:Set<string>}}
+ */
+function mergeWalks(local, remote){
+  const byId = new Map();
+  for(const w of local){
+    if(w && w.id) byId.set(w.id, { local: w, remote: null });
+  }
+  for(const w of remote){
+    if(!w || !w.id) continue;
+    const slot = byId.get(w.id) || { local: null, remote: null };
+    slot.remote = w;
+    byId.set(w.id, slot);
+  }
+  const merged = [];
+  const changedIds = new Set();
+  for(const [id, pair] of byId){
+    if(pair.local && !pair.remote){
+      merged.push(pair.local);
+    } else if(pair.remote && !pair.local){
+      merged.push(pair.remote);
+      changedIds.add(id);
+    } else {
+      const lt = pair.local.updatedAt  || '';
+      const rt = pair.remote.updatedAt || '';
+      if(rt > lt){
+        merged.push(pair.remote);
+        changedIds.add(id);
+      } else {
+        merged.push(pair.local);
+      }
+    }
+  }
+  return { merged, changedIds };
+}
+
+/**
+ * Pull from the configured Gist, merge with local, persist any changed walks
+ * to IDB, populate _lastSyncedSnapshot from the remote contents, and refresh
+ * UI. 401/404 are surfaced as actionable toasts; other errors as generic.
+ *
+ * For walks whose record is replaced by remote (LWW loser, or remote-only),
+ * any photo binaries and GPX rawText already in local IDB stores are
+ * rehydrated onto the in-memory record so renderers continue to work without
+ * a full reload. Walks with no local binaries (cross-device fresh sync) will
+ * render with placeholders, as documented.
+ *
+ * @param {{silent?:boolean}} [opts] - silent suppresses the generic
+ *                                     "Pull failed" toast (used at boot to
+ *                                     avoid a noisy startup when offline);
+ *                                     401/404 toasts still fire because they
+ *                                     require user action regardless.
+ * @returns {Promise<{ok:boolean, changedCount:number}>}
+ */
+async function pullFromGist(opts = {}){
+  const silent = !!opts.silent;
+  const pat = await getPat();
+  if(!pat || !syncConfig.gistId){
+    if(!silent) showToast('Cloud sync not configured', 'error');
+    return { ok: false, changedCount: 0 };
+  }
+  let read;
+  try{
+    read = await gistRead(syncConfig.gistId, pat);
+  }catch(e){
+    if(e.status === 401)      showToast('Bad PAT — re-authenticate in Sync settings', 'error');
+    else if(e.status === 404) showToast('Gist not found — reconfigure in Sync settings', 'error');
+    else if(!silent)          showToast('Pull failed: ' + e.message, 'error');
+    return { ok: false, changedCount: 0 };
+  }
+
+  const { merged, changedIds } = mergeWalks(walks, read.walks);
+
+  // Persist changed walks to IDB and rehydrate their transient binaries
+  for(const id of changedIds){
+    const w = merged.find(x => x.id === id);
+    if(!w) continue;
+    try{
+      await idbPut('walks', _stripTransientForSync(w));
+    }catch(e){ console.warn('Pull: walk IDB write failed', id, e); }
+    // Rehydrate any photo binaries we already have locally (from prior sync
+    // or ZIP import). Missing binaries leave dataUrl undefined → placeholder.
+    if(Array.isArray(w.photos) && w.photos.length){
+      await Promise.all(w.photos.map(async p => {
+        try{ p.dataUrl = await getPhotoDataUrl(p.id); }catch(e){}
+      }));
+    }
+    if(w.gpxMap){
+      try{
+        const gpxRec = await idbGet('gpx', w.id);
+        if(gpxRec){
+          if(gpxRec.blob)    w.gpxMap.dataUrl = await blobToDataUrl(gpxRec.blob);
+          if(gpxRec.rawText) w.gpxMap.rawText = gpxRec.rawText;
+        }
+      }catch(e){}
+    }
+  }
+
+  // Rebuild the snapshot map from raw remote bytes. Stripping transient
+  // fields from local records and reserialising would also work; using the
+  // remote-canonical bytes directly avoids any whitespace drift.
+  _lastSyncedSnapshot = {};
+  for(const [filename, content] of Object.entries(read.raw)){
+    if(filename.startsWith('walk-') && filename.endsWith('.json')){
+      const id = filename.slice('walk-'.length, -'.json'.length);
+      _lastSyncedSnapshot[id] = content;
+    }
+  }
+
+  walks = merged;
+  outboxMarkSynced();
+  updateStats();
+  renderHome();
+  if(document.getElementById('view-history')?.classList.contains('active')) renderHistory();
+
+  return { ok: true, changedCount: changedIds.size };
+}
+
+/**
+ * Dispatch a single outbox item to the Gist backend. Throws on failure;
+ * caller (outboxFlush) interprets .status to decide retry vs permanent fail.
+ * Silently no-ops for malformed payloads or stale references (walk deleted
+ * locally before the queue could flush).
+ * @param {Object} item - Outbox item
+ */
+async function dispatchGistOp(item){
+  const pat = await getPat();
+  if(!pat) throw Object.assign(new Error('No PAT configured'), { status: 401 });
+  if(!syncConfig.gistId) throw Object.assign(new Error('No Gist ID configured'), { status: 404 });
+
+  const metaJson = await _buildMetaJson();
+
+  if(item.type === 'sync_walk'){
+    const walkId = item.payload && item.payload.walkId;
+    if(!walkId) return;
+    const walk = walks.find(w => w.id === walkId);
+    if(!walk) return;   // walk gone locally before flush — drop silently
+    const cleanWalk  = _stripTransientForSync(walk);
+    const serialised = _serialiseWalk(cleanWalk);
+    if(_lastSyncedSnapshot[walkId] === serialised) return;   // unchanged — skip
+    await gistWrite(syncConfig.gistId, pat, {
+      [`walk-${walkId}.json`]: serialised,
+      [GIST_META_FILENAME]:    metaJson,
+    });
+    _lastSyncedSnapshot[walkId] = serialised;
+    return;
+  }
+
+  if(item.type === 'sync_delete'){
+    const walkId = item.payload && item.payload.walkId;
+    if(!walkId) return;
+    try{
+      await gistDeleteFile(syncConfig.gistId, pat, `walk-${walkId}.json`);
+    }catch(e){
+      // 422 typically means the file was already absent — treat as success
+      if(e.status !== 422) throw e;
+    }
+    try{
+      await gistWrite(syncConfig.gistId, pat, { [GIST_META_FILENAME]: metaJson });
+    }catch(e){ console.warn('Meta update after delete failed', e); }
+    delete _lastSyncedSnapshot[walkId];
+    return;
+  }
+
+  throw new Error('Unknown gist op type: ' + item.type);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  SECTION 7 — SYNC & BACKUP PANEL  (Phase C, brief §7.1)
 //
 //  The Sync & Backup modal replaces the old Drive modal. It exposes:
@@ -1488,9 +1952,11 @@ async function renderSyncPanel(){
     if(failedItems.length){
       pane.style.display = 'block';
       list.innerHTML = failedItems.map(i => {
-        const label = i.type === 'sync_master'
-          ? 'Master sync'
-          : `${esc(i.type)}`;
+        const wid = (i.payload && i.payload.walkId) ? esc(String(i.payload.walkId).slice(0,8)) : '';
+        const label = i.type === 'sync_master' ? 'Master sync'
+                    : i.type === 'sync_walk'   ? `Save walk ${wid}…`
+                    : i.type === 'sync_delete' ? `Delete walk ${wid}…`
+                    : `${esc(i.type)}`;
         const when = i.lastAttempt ? new Date(i.lastAttempt).toLocaleString('en-GB') : '—';
         return `<div class="failed-item">
           <span class="failed-item-label">⚠ ${label} — last attempt ${when}</span>
@@ -1520,6 +1986,282 @@ async function renderSyncPanel(){
       report.textContent = `${walkCount} walks · ${photoCount} photos · ${gpxCount} routes${usageStr}`;
     }catch(e){ report.textContent = 'unavailable'; }
   }
+
+  // Pane B — cloud sync status (Option B)
+  await renderSyncBackendPane();
+}
+
+// ─── Pane B — Cloud sync (Gist) ───────────────────────────────────────────────
+//
+// Two states rendered into #syncBackendInfo:
+//   • Disabled — PAT input + "Create new sync Gist" / "Connect to existing Gist"
+//   • Active   — Gist ID, device, last-synced, "Sync now" / "Reset PAT" /
+//                "Disconnect" buttons
+//
+// PAT validation runs on the input's change event (one validation request
+// per blur); the action buttons stay disabled until validation succeeds.
+// All async actions surface a status line in #syncProgress and a toast on
+// completion, matching the ZIP backup pane's UX.
+
+/** Validate a PAT by calling GET /gists. Returns true on 2xx, false otherwise.
+ *  GET /gists requires the 'gist' scope (which is what we want), unlike
+ *  GET /user which requires 'user' scope. */
+async function syncValidatePat(pat){
+  try{
+    const res = await fetch(`${GIST_API}/gists?per_page=1`, {
+      headers: {
+        'Authorization': `token ${pat}`,
+        'Accept':        'application/vnd.github+json',
+      },
+    });
+    return res.ok;
+  }catch(e){ return false; }
+}
+
+/** Set/clear the small progress line under the cloud-sync action buttons. */
+function _setSyncProgress(msg){
+  const el = document.getElementById('syncProgress');
+  if(!el) return;
+  if(!msg){ el.style.display = 'none'; el.textContent = ''; return; }
+  el.style.display = 'block';
+  el.textContent = msg;
+}
+
+/** Build a compact PAT hint for display (first 4 + last 4 chars). */
+function _patHintFor(pat){
+  if(!pat || pat.length < 8) return '••••';
+  return pat.slice(0,4) + '…' + pat.slice(-4);
+}
+
+/** Render the cloud-sync pane in either Disabled or Active state. */
+async function renderSyncBackendPane(){
+  const root = document.getElementById('syncBackendInfo');
+  if(!root) return;
+  const isActive = syncConfig.backend === 'gist' && !!syncConfig.gistId;
+
+  if(isActive){
+    const deviceId      = await getDeviceId();
+    const lastLabel     = outboxLastSyncedLabel();
+    const pendingCount  = outboxLoad().filter(i => i.status === 'pending').length;
+    const queuedNote    = pendingCount ? ` · <strong>${pendingCount}</strong> queued` : '';
+    const gistUrl       = `https://gist.github.com/${esc(syncConfig.gistId)}`;
+    root.innerHTML = `
+      <p class="sync-pane-blurb"><strong>Cloud sync active.</strong> Walk metadata is mirrored to a private GitHub Gist as one JSON sidecar per walk. Photos and GPX files remain device-local — use ZIP backup to move binaries between devices.</p>
+      <div class="sync-pane-blurb" style="font-size:.78rem;color:var(--slate-light);line-height:1.7">
+        <div>Gist: <a href="${gistUrl}" target="_blank" rel="noopener" style="color:var(--blue-light)"><code>${esc(syncConfig.gistId)}</code></a></div>
+        <div>Device: <code>${esc(deviceId.slice(0,12))}…</code></div>
+        <div>Last synced: ${esc(lastLabel || 'never')}${queuedNote}</div>
+      </div>
+      <div class="sync-pane-actions">
+        <button class="btn btn-primary"   id="syncNowBtn">↻ Sync now</button>
+        <button class="btn btn-secondary" id="syncResetPatBtn">Reset PAT</button>
+        <button class="btn btn-danger"    id="syncDisconnectBtn">Disconnect</button>
+      </div>
+      <div id="syncProgress" class="sync-progress" style="display:none"></div>
+    `;
+    document.getElementById('syncNowBtn')       .addEventListener('click', syncNow);
+    document.getElementById('syncResetPatBtn')  .addEventListener('click', syncResetPat);
+    document.getElementById('syncDisconnectBtn').addEventListener('click', syncDisconnect);
+    return;
+  }
+
+  // Disabled state — PAT entry + create / connect buttons
+  root.innerHTML = `
+    <p class="sync-pane-blurb"><strong>No cloud sync configured.</strong> Connect a private GitHub Gist to mirror walk metadata between devices. Photos and GPX files stay device-local.</p>
+    <div class="field" style="margin-bottom:10px">
+      <label for="syncPatInput" style="font-family:var(--font-ui);font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--slate);display:block;margin-bottom:5px">GitHub Personal Access Token <span style="color:var(--slate-light);text-transform:none;letter-spacing:0">(<code>gist</code> scope only)</span></label>
+      <input type="password" id="syncPatInput" placeholder="ghp_…" autocomplete="off" spellcheck="false" style="font-family:monospace;font-size:.85rem;padding:8px 11px;border:1px solid var(--sand-deep);border-radius:var(--radius);background:var(--sand-light);width:100%;box-sizing:border-box">
+      <div id="syncPatStatus" style="font-family:var(--font-ui);font-size:.7rem;margin-top:6px;min-height:16px"></div>
+    </div>
+    <div class="sync-pane-actions">
+      <button class="btn btn-primary"   id="syncCreateBtn"  disabled>Create new sync Gist</button>
+      <button class="btn btn-secondary" id="syncConnectToggle">Connect to existing Gist…</button>
+    </div>
+    <div id="syncConnectExisting" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--sand-deep)">
+      <div class="field" style="margin-bottom:10px">
+        <label for="syncGistIdInput" style="font-family:var(--font-ui);font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--slate);display:block;margin-bottom:5px">Existing Gist ID</label>
+        <input type="text" id="syncGistIdInput" placeholder="32-character hex ID from the Gist URL" autocomplete="off" spellcheck="false" style="font-family:monospace;font-size:.85rem;padding:8px 11px;border:1px solid var(--sand-deep);border-radius:var(--radius);background:var(--sand-light);width:100%;box-sizing:border-box">
+      </div>
+      <div class="sync-pane-actions">
+        <button class="btn btn-primary" id="syncConnectBtn" disabled>Connect &amp; pull</button>
+      </div>
+    </div>
+    <p class="sync-pane-blurb" style="font-size:.7rem;color:var(--slate-light);margin-top:12px;line-height:1.6">
+      Generate a PAT at <a href="https://github.com/settings/tokens" target="_blank" rel="noopener" style="color:var(--blue-light)">github.com/settings/tokens</a> (Tokens classic) with the <code>gist</code> scope only. The token is stored locally in this device's IndexedDB and is never included in ZIP backups, walks.json, or any sidecar file.
+    </p>
+    <div id="syncProgress" class="sync-progress" style="display:none"></div>
+  `;
+
+  const patInput      = document.getElementById('syncPatInput');
+  const patStatus     = document.getElementById('syncPatStatus');
+  const createBtn     = document.getElementById('syncCreateBtn');
+  const connectBtn    = document.getElementById('syncConnectBtn');
+  const connectToggle = document.getElementById('syncConnectToggle');
+  const connectPanel  = document.getElementById('syncConnectExisting');
+  let _patValid = false;
+
+  patInput.addEventListener('input', () => {
+    _patValid = false;
+    createBtn.disabled  = true;
+    connectBtn.disabled = true;
+    patStatus.textContent = '';
+    patStatus.style.color = '';
+  });
+
+  // Validate on blur (keeps the rate of GitHub calls low)
+  patInput.addEventListener('change', async () => {
+    const pat = patInput.value.trim();
+    if(!pat){ patStatus.textContent = ''; return; }
+    patStatus.textContent = 'Validating…';
+    patStatus.style.color = 'var(--slate)';
+    const ok = await syncValidatePat(pat);
+    _patValid = ok;
+    if(ok){
+      patStatus.textContent = '✓ PAT accepted';
+      patStatus.style.color = 'var(--green)';
+      createBtn.disabled  = false;
+      connectBtn.disabled = false;
+    } else {
+      patStatus.textContent = '✕ PAT rejected — check token and that it has the gist scope';
+      patStatus.style.color = 'var(--copper)';
+    }
+  });
+
+  connectToggle.addEventListener('click', () => {
+    connectPanel.style.display = connectPanel.style.display === 'none' ? 'block' : 'none';
+  });
+
+  createBtn.addEventListener('click', async () => {
+    if(!_patValid) return;
+    await syncCreateNew(patInput.value.trim());
+  });
+
+  connectBtn.addEventListener('click', async () => {
+    if(!_patValid) return;
+    const gistId = document.getElementById('syncGistIdInput').value.trim();
+    if(!gistId){ showToast('Enter a Gist ID', 'error'); return; }
+    await syncConnectExisting(patInput.value.trim(), gistId);
+  });
+}
+
+/**
+ * Create a new secret Gist seeded with current local walks, save the
+ * config, populate the snapshot map, and switch the pane to Active state.
+ */
+async function syncCreateNew(pat){
+  _setSyncProgress('Creating new Gist…');
+  try{
+    const cleanWalks = walks.map(_stripTransientForSync);
+    const deviceId = await getDeviceId();
+    const meta = {
+      schemaVersion: GIST_SCHEMA_VERSION,
+      lastUpdated:   new Date().toISOString(),
+      deviceId,
+      walkCount:     cleanWalks.length,
+    };
+    const newGistId = await gistCreate(pat, cleanWalks, meta);
+    syncConfig = { backend: 'gist', gistId: newGistId, patHint: _patHintFor(pat) };
+    await setPat(pat);
+    await saveSyncConfig();
+    // Seed the snapshot map so subsequent enqueues skip unchanged walks
+    _lastSyncedSnapshot = {};
+    for(const w of cleanWalks){
+      _lastSyncedSnapshot[w.id] = _serialiseWalk(w);
+    }
+    outboxMarkSynced();
+    _setSyncProgress('');
+    showToast(`Sync Gist created (${newGistId.slice(0,8)}…)`, 'success');
+    await renderSyncBackendPane();
+    syncStatusUpdate();
+  }catch(e){
+    _setSyncProgress('');
+    if(e.status === 401) showToast('PAT rejected — check the gist scope', 'error');
+    else                  showToast('Create failed: ' + e.message, 'error');
+  }
+}
+
+/**
+ * Connect to an existing Gist: validate via a read attempt, save config,
+ * pull and merge in one go.
+ */
+async function syncConnectExisting(pat, gistId){
+  _setSyncProgress('Connecting and pulling…');
+  // Validate the gist ID with a read attempt before we save anything
+  try{
+    await gistRead(gistId, pat);
+  }catch(e){
+    _setSyncProgress('');
+    if(e.status === 404)      showToast('Gist not found — check the ID', 'error');
+    else if(e.status === 401) showToast('PAT rejected by Gist read', 'error');
+    else                       showToast('Connect failed: ' + e.message, 'error');
+    return;
+  }
+  syncConfig = { backend: 'gist', gistId, patHint: _patHintFor(pat) };
+  await setPat(pat);
+  await saveSyncConfig();
+  const result = await pullFromGist();
+  _setSyncProgress('');
+  if(result.ok){
+    showToast(`Connected — ${result.changedCount} walk(s) pulled`, 'success');
+  }
+  await renderSyncBackendPane();
+  syncStatusUpdate();
+}
+
+/** Tear down cloud sync entirely: clear PAT, set backend to 'none', save. */
+async function syncDisconnect(){
+  if(!confirm('Disconnect cloud sync?\n\nThe Gist itself remains on GitHub — you can reconnect later. Local walks are unaffected.')) return;
+  await setPat(null);
+  syncConfig = { backend: 'none', gistId: null, patHint: null };
+  await saveSyncConfig();
+  _lastSyncedSnapshot = {};
+  showToast('Disconnected from cloud sync');
+  await renderSyncBackendPane();
+  syncStatusUpdate();
+}
+
+/**
+ * Replace the stored PAT without disconnecting from the Gist. Useful when
+ * a token has expired or been rotated. Validates the new token before
+ * saving so we never persist a broken credential.
+ */
+async function syncResetPat(){
+  const newPat = prompt('Enter new GitHub PAT (gist scope).\n\nLeave blank and press OK to cancel.');
+  if(!newPat) return;
+  const trimmed = newPat.trim();
+  if(!trimmed) return;
+  _setSyncProgress('Validating PAT…');
+  const ok = await syncValidatePat(trimmed);
+  _setSyncProgress('');
+  if(!ok){
+    showToast('PAT rejected — not saved', 'error');
+    return;
+  }
+  await setPat(trimmed);
+  syncConfig.patHint = _patHintFor(trimmed);
+  await saveSyncConfig();
+  showToast('PAT updated', 'success');
+  await renderSyncBackendPane();
+}
+
+/** Manual "Sync now" — pull from remote, then push any queued changes. */
+async function syncNow(){
+  _setSyncProgress('Pulling from Gist…');
+  const pull = await pullFromGist();
+  if(!pull.ok){
+    _setSyncProgress('');
+    await renderSyncBackendPane();
+    return;
+  }
+  _setSyncProgress('Pushing queued changes…');
+  await outboxFlush();
+  _setSyncProgress('');
+  const remaining = outboxLoad().filter(i => i.status === 'pending').length;
+  const failed    = outboxLoad().filter(i => i.status === 'failed').length;
+  if(!remaining && !failed) showToast('Sync complete', 'success');
+  else if(failed)           showToast(`${failed} operation(s) failed — see Failed sync items`, 'error');
+  else                       showToast(`${remaining} operation(s) still pending — will retry`);
+  await renderSyncBackendPane();
 }
 
 /** Update the ZIP progress region with a status line. */
@@ -2227,6 +2969,7 @@ function createWalkRecord(overrides = {}){
     photos:       [],
     gpxMap:       null,
     createdAt:    new Date().toISOString(),
+    updatedAt:    new Date().toISOString(),   // refreshed in saveWalk on every save; per-walk LWW key for Gist sync
   };
   return { ...defaults, ...overrides };
 }
@@ -2250,10 +2993,10 @@ async function persistWalk(walk,btn){
   await saveLocal();
   updateStats();
 
-  // Future cloud sync (Option B): when syncConfig.backend !== 'none', enqueue
-  // a master sync; the outbox dispatcher then writes to the chosen backend.
+  // Cloud sync (Option B — Gist): enqueue a per-walk push. The outbox
+  // dispatcher coalesces by walkId so rapid edits collapse to one push.
   if(syncConfig.backend !== 'none'){
-    outboxEnqueue('sync_master', {});
+    outboxEnqueue('sync_walk', { walkId: walk.id });
   }
 
   showToast('Walk saved');
@@ -2299,6 +3042,7 @@ async function saveWalk(e){
     walkTime: form.walkTime != null ? parseFloat(form.walkTime.toFixed(2)) : null,
     photos:   savedPhotos,
     gpxMap,
+    updatedAt: new Date().toISOString(),   // refresh on every save — drives Gist LWW merge
   });
   await persistWalk(walk,btn);
 
@@ -2378,7 +3122,7 @@ async function deleteWalk(id){
   // consistent with on-disk state.
   await saveLocal();
   if(syncConfig.backend !== 'none'){
-    outboxEnqueue('sync_master', {});
+    outboxEnqueue('sync_delete', { walkId: id });
   }
   showToast('Walk deleted');
   updateOutboxBadge();
@@ -3075,6 +3819,19 @@ function registerServiceWorker(){
   }
 
   updateStats();renderHome();
+
+  // Cloud sync (Option B): pull from Gist on boot before starting the outbox
+  // flush loop. The pull runs the merge-and-persist path, populates
+  // _lastSyncedSnapshot, and refreshes the UI; outboxInit() then flushes any
+  // queued local changes that accumulated while the device was offline.
+  // silent:true suppresses the generic "Pull failed" toast — when offline
+  // at boot we just carry on with local data; 401/404 still toast because
+  // they need user action.
+  if(syncConfig.backend === 'gist' && syncConfig.gistId && navigator.onLine){
+    try{ await pullFromGist({ silent: true }); }
+    catch(e){ console.warn('Boot pull failed', e); }
+  }
+
   // Start offline outbox flush loop (no-op while syncConfig.backend === 'none')
   outboxInit();
   updateOutboxBadge();
