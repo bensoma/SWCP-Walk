@@ -2,7 +2,7 @@
   "name": "South West Coast Path — Walk Journal",
   "short_name": "SWCP Journal",
   "description": "Personal walk journal for the South West Coast Path with photos, GPX routes, and PDF book export. Works offline.",
-  "id": "swcp-journal",
+  "id": "swcp-redesign-journal",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
